@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "fetch": {
+      "args": [
+        "/Users/wei/Downloads/mcps/fetch-mcp/dist/index.js"
+      ],
+      "command": "node"
+    },
+    "mysql-mcp-server": {
+      "args": [
+        "/Users/wei/Downloads/mcps/mysql-mcp-server/build/index.js"
+      ],
+      "autoApprove": [],
+      "command": "node",
+      "disabled": false,
+      "env": {
+        "MCP_OPEN_BROWSER": "false",
+        "MYSQL_DATABASE": "ruoyi-vue-pro",
+        "MYSQL_HOST": "127.0.0.1",
+        "MYSQL_PASSWORD": "123456",
+        "MYSQL_PORT": "3306",
+        "MYSQL_USER": "root"
+      },
+      "timeout": 60,
+      "transportType": "stdio"
+    }
+  }
+}
