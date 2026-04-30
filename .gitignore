@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# IDE
+.vscode/
+.idea/
