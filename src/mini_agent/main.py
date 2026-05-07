@@ -1,5 +1,5 @@
 """
-Phase 7: CLI 入口 — 支持 Tool Calling + MCP + 子 Agent 委派
+Phase 7-mw: CLI 入口 — create_agent + SubagentLimitMiddleware + SandboxMiddleware + SummarizationMiddleware
 
 显示逻辑:
   - 文本 chunk → 逐字打印（打字机效果）
@@ -230,7 +230,7 @@ def main() -> None:
                 node = metadata.get("langgraph_node", "")
 
                 # --- LLM 产出的 chunk ---
-                if node == "agent":
+                if node == "model":
                     if token_text and isinstance(token_text, str):
                         print(token_text, end="", flush=True)
                         in_tool_call = False
