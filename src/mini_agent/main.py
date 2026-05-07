@@ -1,11 +1,7 @@
 """
-Phase 5: CLI 入口 — 支持 Tool Calling + MCP 的流式对话
+Phase 5-mw: CLI 入口 — create_agent + MCP + SandboxMiddleware + SummarizationMiddleware
 
-显示逻辑:
-  - 文本 chunk → 逐字打印（打字机效果）
-  - tool_call 开始 → 打印工具调用信息
-  - ToolMessage → 打印工具返回结果
-  - 工具执行后继续的文本 → 继续逐字打印
+create_agent 的 LLM 节点名是 "model"（不是 "agent"），流式事件中 metadata 对应修改。
 """
 
 import sys
@@ -162,7 +158,7 @@ def main() -> None:
                 node = metadata.get("langgraph_node", "")
 
                 # --- LLM 产出的 chunk ---
-                if node == "agent":
+                if node == "model":
                     # 逐 token 打字机效果
                     if token_text and isinstance(token_text, str):
                         print(token_text, end="", flush=True)
