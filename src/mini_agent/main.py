@@ -87,7 +87,7 @@ def handle_command(cmd: str, agent: LangGraphAgent, thread_id: list) -> bool:
 
 
 def main() -> None:
-    """Phase 2 主循环。"""
+    """Phase 3-mw 主循环。"""
     # 1. 加载配置
     try:
         config = Config()
@@ -141,7 +141,7 @@ def main() -> None:
                 node = metadata.get("langgraph_node", "")
 
                 # --- LLM 产出的 chunk ---
-                if node == "agent":
+                if node == "model":
                     # 逐 token 打字机效果
                     if token_text and isinstance(token_text, str):
                         print(token_text, end="", flush=True)
