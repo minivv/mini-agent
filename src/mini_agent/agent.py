@@ -1,135 +1,130 @@
 """
-Phase 2: LangGraph ReAct Agent
+Phase 8-mw: LangGraph ReAct Agent — create_agent + SandboxMiddleware + SummarizationMiddleware + SubagentLimitMiddleware + TodoMiddleware
 
-这是从 Phase 1 到 Phase 2 的核心变化: 从简单的 ChatModel 调用演进为
-基于 LangGraph 的 ReAct Agent。
+旧方式 (Phase 8 原版):
+  手动 StateGraph + AgentState (含 todos)
+  process_todos, todo_check, todo_guard 图节点
 
-════════════════════════════════════════════════════════════════════════════
-LangGraph 核心概念
-════════════════════════════════════════════════════════════════════════════
-
-1. StateGraph — Agent 的"蓝图"
-   一个 StateGraph 由节点(nodes)和边(edges)组成，定义了 agent 的控制流。
-   这比 Phase 1 的 while 循环更强大，因为它支持:
-     - 条件分支 (conditional edges)
-     - 状态持久化 (checkpointer)
-     - 流式事件 (streaming events)
-     - 人工干预 (interrupts)
-
-2. State — 在节点间流动的数据
-   用 TypedDict 定义，每个字段可以有自己的 reducer。
-   比如 messages 用 add_messages (追加而非替换)。
-
-3. Nodes — 执行逻辑的"步骤"
-   每个节点是一个函数: 接收 State → 返回 State 的部分更新。
-   Phase 2 有两个节点:
-     - agent  节点: 调用 LLM (bind_tools 后)，LLM 决定是回复还是调用工具
-     - tools  节点: 执行 LLM 请求的工具调用
-
-4. Edges — 节点间的"箭头"
-     - Normal edge:  总是从 A 到 B
-     - Conditional edge: 根据 State 决定下一个节点
-       比如: LLM 输出里有 tool_calls → 去 tools 节点
-            没有 tool_calls → 结束
-
-5. Checkpointer — 状态持久化
-   MemorySaver 把每次节点的输入/输出存到内存里。
-   通过 thread_id 区分不同对话。这就是"多轮对话"在 LangGraph 中的实现方式。
-
-════════════════════════════════════════════════════════════════════════════
-ReAct 模式
-════════════════════════════════════════════════════════════════════════════
-
-ReAct = Reasoning + Acting
-  1. LLM 收到用户消息 → 思考(Reasoning)
-  2. 如果需要工具 → 输出 tool_call (Acting)
-  3. 工具执行 → 返回结果给 LLM
-  4. LLM 基于结果继续思考 → 直到给出最终回答
-
-在 LangGraph 中的实现:
-  START → agent → [有 tool_calls?] → tools → agent → [有 tool_calls?] → ... → END
-                    ↓ 没有                                      ↓ 没有
+新方式 (Phase 8-mw):
+  SandboxMiddleware: before_agent 注入 workspace_dir 和 skills_dir
+  SummarizationMiddleware: after_model 检查 token 数，超阈值时摘要压缩
+  SubagentLimitMiddleware: after_model 截断多余的 task 调用
+  TodoMiddleware: after_model 处理 write_todos 状态更新 + 上下文丢失检测 + 完成防护
 """
 
-from typing import Annotated, TypedDict
 from typing import Any
 
-from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph.message import add_messages
+from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import (
-    BaseMessage, HumanMessage, SystemMessage,
-    AIMessage, ToolMessage, RemoveMessage,
+    BaseMessage, HumanMessage, AIMessage, ToolMessage, RemoveMessage,
 )
+from langgraph.checkpoint.memory import MemorySaver
 
 from mini_agent.config import Config
 from mini_agent.chat import create_model, build_system_prompt, build_subagent_section, build_todo_section
 from mini_agent.context import count_message_tokens, summarize_messages
 
 
-# ---------------------------------------------------------------------------
-# 辅助: 从 AIMessageChunk 提取可显示文本
-# ---------------------------------------------------------------------------
-# 不同模型/提供商把 token 文本放在不同字段:
-#   - 大多数模型:  chunk.content 直接就是文本
-#   - DeepSeek thinking 模型: 文本在 additional_kwargs["reasoning_content"]
-#     且 content 通常为空字符串
-
 def _extract_display_text(chunk) -> str:
-    """从 AIMessageChunk 中提取可显示的文本 token。"""
     if chunk is None:
         return ""
-
-    # 优先级 1: chunk.content（大多数模型的文本在这里）
     if chunk.content:
         if isinstance(chunk.content, str):
             return chunk.content
         if isinstance(chunk.content, list):
             return "".join(str(c) for c in chunk.content)
-
-    # 优先级 2: additional_kwargs 中的 reasoning_content (DeepSeek thinking)
     reasoning = chunk.additional_kwargs.get("reasoning_content", "")
     if reasoning:
         return reasoning
-
     return ""
 
 
-# ---------------------------------------------------------------------------
-# State 定义: 什么数据在节点之间流动
-# ---------------------------------------------------------------------------
-# add_messages 是 LangGraph 内置的 reducer:
-#   不是替换 messages 列表，而是把新消息追加到列表末尾。
-#   并且它自动合并 AIMessageChunk（把流式碎片拼成完整消息）。
+class SandboxMiddleware(AgentMiddleware):
+    """在每次 agent 执行前初始化沙箱工作目录和 skills 目录。"""
 
-class AgentState(TypedDict, total=False):
-    """Agent 的状态定义。每个字段在不同节点之间流动。
+    def __init__(self, skills_dir: str | None = None):
+        super().__init__()
+        self.skills_dir = skills_dir
 
-    total=False 表示字段可以不存在，首次注入时不会因为缺少字段报错。
-    """
-    messages: Annotated[list[BaseMessage], add_messages]
-    # Phase 3: 沙箱工作目录 (绝对路径)，每个线程有独立的沙箱
-    workspace_dir: str
-    # Phase 6: Skills 目录路径
-    skills_dir: str
-    # Phase 8: Todo 列表（每次 write_todos 整体替换）
-    todos: list
+    def before_agent(self, state: dict, config: dict) -> dict:
+        thread_id = config.get("configurable", {}).get("thread_id", "default")
+        from mini_agent.sandbox import Sandbox
+        sandbox = Sandbox(thread_id=thread_id, skills_dir=self.skills_dir)
+        state["workspace_dir"] = str(sandbox.workspace)
+        if sandbox.skills_dir:
+            state["skills_dir"] = str(sandbox.skills_dir)
+        return state
 
 
-# ---------------------------------------------------------------------------
-# LangGraphAgent: 基于图的 Agent
-# ---------------------------------------------------------------------------
+class SummarizationMiddleware(AgentMiddleware):
+    """在 LLM 回复后检查对话长度，超阈值时用 LLM 摘要压缩。"""
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+        self.model_sync = create_model(config, streaming=False)
+
+    def after_model(self, state: dict, config: dict) -> dict:
+        messages = state.get("messages", [])
+        total_tokens = count_message_tokens(messages)
+        if total_tokens > self.config.max_context_tokens:
+            updates = summarize_messages(
+                messages, self.model_sync,
+                keep_recent=self.config.keep_recent_messages,
+            )
+            if updates:
+                removed_tool_call_ids: set[str] = set()
+                for u in updates:
+                    if isinstance(u, RemoveMessage):
+                        for msg in messages:
+                            if msg.id == u.id and isinstance(msg, AIMessage):
+                                for tc in (msg.tool_calls or []):
+                                    if "id" in tc:
+                                        removed_tool_call_ids.add(tc["id"])
+                for msg in messages:
+                    if isinstance(msg, ToolMessage):
+                        tc_id = getattr(msg, "tool_call_id", None)
+                        if tc_id and tc_id in removed_tool_call_ids:
+                            updates.append(RemoveMessage(id=msg.id))
+                return {"messages": updates}
+        return {}
+
+
+class SubagentLimitMiddleware(AgentMiddleware):
+    """截断 LLM 单次输出中多余的 task 调用。"""
+
+    def __init__(self, limit: int = 3):
+        super().__init__()
+        self.limit = limit
+
+    def after_model(self, state: dict, config: dict) -> dict:
+        from mini_agent.task_tool import truncate_task_calls
+        messages = state.get("messages", [])
+        updates = truncate_task_calls(messages, self.limit)
+        return {"messages": updates} if updates else {}
+
+
+class TodoMiddleware(AgentMiddleware):
+    """处理 write_todos 状态更新 + 上下文丢失检测 + 完成防护。"""
+
+    def after_model(self, state: dict, config: dict) -> dict:
+        from mini_agent.todo import process_todos, check_todo_context, guard_todo_completion
+        # 1. 从 write_todos 提取 todos 更新 state
+        result = process_todos(state)
+        # 2. 检查上下文丢失
+        todo_check = check_todo_context(state)
+        if todo_check:
+            result.update(todo_check)
+        # 3. 防止提前退出
+        todo_guard = guard_todo_completion(state)
+        if todo_guard:
+            result.update(todo_guard)
+        return result
+
 
 class LangGraphAgent:
-    """
-    Phase 2 的 Agent: 用 LangGraph 构建的 ReAct Agent。
-
-    用法:
-        agent = LangGraphAgent(config, tools)
-        for event in agent.stream("帮我算一下 123 * 456"):
-            print(event)
-    """
+    """用 create_agent + Middleware 链构建的 Agent。"""
 
     def __init__(
         self,
@@ -139,7 +134,7 @@ class LangGraphAgent:
         skills_dir: str | None = None,
         subagent_enabled: bool = False,
         subagent_limit: int = 3,
-        _sub_thread_id: str | None = None,
+        middleware: list | None = None,
     ):
         self.config = config
         self.tools = tools
@@ -147,192 +142,37 @@ class LangGraphAgent:
         self.skills_dir = skills_dir
         self.subagent_enabled = subagent_enabled
         self.subagent_limit = subagent_limit
+        self.middleware = middleware or []
         self.model = create_model(config, streaming=True)
-        self.model_sync = create_model(config, streaming=False)
         self.checkpointer = MemorySaver()
-        self.graph = self._build_graph()
 
-    # ------------------------------------------------------------------
-    # LangGraph 核心概念 #1: 构建图 (build graph)
-    # ------------------------------------------------------------------
-    # StateGraph 是图的结构定义。
-    # 我们用 .add_node() 添加节点, .add_edge() 和 .add_conditional_edges() 添加边。
-    # .compile() 把图编译成一个可执行的 Runnable。
+        subagent_section = ""
+        if subagent_enabled:
+            subagent_section = build_subagent_section(subagent_limit)
 
-    def _build_graph(self):
-        """构建 ReAct Agent 图。"""
-        builder = StateGraph(AgentState)
+        system_prompt = build_system_prompt(
+            skills_section, subagent_section, build_todo_section(),
+        )
 
-        # --- 节点 1: agent ---
-        # bind_tools() 把工具列表注入到 model 中，让 LLM 知道:
-        #   "你可以调用这些工具，这是它们的签名。"
-        # 当 LLM 想用工具时，AIMessage 里会包含 tool_calls 字段。
-        def call_model(state: AgentState):
-            model_with_tools = self.model.bind_tools(self.tools)
-            response = model_with_tools.invoke(state["messages"])
-            return {"messages": [response]}
+        mw_list = [
+            SandboxMiddleware(skills_dir=skills_dir),
+            SummarizationMiddleware(config),
+        ]
+        if subagent_enabled:
+            mw_list.append(SubagentLimitMiddleware(limit=subagent_limit))
+        mw_list.append(TodoMiddleware())
+        mw_list.extend(self.middleware)
 
-        builder.add_node("agent", call_model)
-
-        # --- 节点 2: tools ---
-        # ToolNode 是 LangGraph 预置的工具执行节点。
-        # 它读取上一条 AIMessage 的 tool_calls，逐一执行，返回 ToolMessage 列表。
-        builder.add_node("tools", ToolNode(self.tools))
-
-        # --- 节点 2.5: process_todos (Phase 8) ---
-        # write_todos 工具只能返回字符串（ToolMessage），无法直接更新 state。
-        # 这个节点在 tools 执行后检查是否有 write_todos 调用，
-        # 如果有，从 AIMessage.tool_calls 中提取 todos 参数写入 state。
-        from mini_agent.todo import process_todos
-        builder.add_node("process_todos", process_todos)
-
-        # --- 节点 3: check_context (Phase 4) ---
-        # 在 agent 回复后（或工具执行后），检查对话是否过长。
-        # 如果 token 数超过阈值，用 LLM 总结旧消息来压缩上下文。
-        # 这样对话可以无限进行下去，不会超出 LLM 的上下文窗口。
-        def check_context(state: AgentState):
-            messages = state["messages"]
-            total_tokens = count_message_tokens(messages)
-            if total_tokens > self.config.max_context_tokens:
-                updates = summarize_messages(
-                    messages, self.model_sync,
-                    keep_recent=self.config.keep_recent_messages,
-                )
-                if updates:
-                    # 清理孤立的 ToolMessage:
-                    # 摘要删除了 AIMessage（含 tool_calls），但对应的 ToolMessage
-                    # 可能还在消息列表里。找到被删除的 AIMessage 的 tool_call ids，
-                    # 把引用这些 ids 的 ToolMessage 也删掉。
-                    removed_tool_call_ids: set[str] = set()
-                    for u in updates:
-                        if isinstance(u, RemoveMessage):
-                            for msg in messages:
-                                if msg.id == u.id and isinstance(msg, AIMessage):
-                                    for tc in (msg.tool_calls or []):
-                                        if "id" in tc:
-                                            removed_tool_call_ids.add(tc["id"])
-                    for msg in messages:
-                        if isinstance(msg, ToolMessage):
-                            tc_id = getattr(msg, "tool_call_id", None)
-                            if tc_id and tc_id in removed_tool_call_ids:
-                                updates.append(RemoveMessage(id=msg.id))
-                return {"messages": updates}
-            return {}  # 不需要摘要，返回空更新
-
-        builder.add_node("check_context", check_context)
-
-        # --- 节点 4: todo_check (Phase 8) ---
-        # 检测 write_todos 是否因摘要压缩而从历史中丢失，
-        # 如果丢失则注入提醒消息让 LLM 继续追踪任务进度。
-        from mini_agent.todo import check_todo_context, guard_todo_completion
-        builder.add_node("todo_check", check_todo_context)
-
-        # --- 节点 5: todo_guard (Phase 8) ---
-        # 检查 LLM 是否在 todo 未完成时试图给出最终回复（无 tool_calls），
-        # 如果是，注入提醒强制 LLM 继续工作。
-        builder.add_node("todo_guard", guard_todo_completion)
-
-        # --- 节点 6: subagent_limit (Phase 7) ---
-        # 截断 LLM 单次输出中多余的 task 调用。
-        # 如果 LLM 在一条消息中发出超过 subagent_limit 个 task 调用，
-        # 只保留前 subagent_limit 个，其余丢弃。
-        if self.subagent_enabled:
-            def limit_subagents(state: AgentState):
-                from mini_agent.task_tool import truncate_task_calls
-                updates = truncate_task_calls(
-                    state["messages"], self.subagent_limit,
-                )
-                return {"messages": updates} if updates else {}
-
-            builder.add_node("subagent_limit", limit_subagents)
-
-        # --- 边 ---
-        # Entry point: 从 START 开始
-        builder.add_edge(START, "agent")
-
-        # 条件边: 检查最后一条消息
-        #   如果有 tool_calls → 去 subagent_limit (如果启用) 或 tools 节点
-        #   如果没有         → 去 check_context（检查是否需要摘要）
-        def route_after_agent(state: AgentState):
-            last_msg = state["messages"][-1]
-            if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                if self.subagent_enabled:
-                    return "subagent_limit"
-                return "tools"
-            return "check_context"
-
-        builder.add_conditional_edges("agent", route_after_agent)
-
-        if self.subagent_enabled:
-            builder.add_edge("subagent_limit", "tools")
-
-        # 普通边: tools → process_todos → agent
-        # process_todos 从 write_todos 调用中提取参数更新 state，然后回到 agent
-        builder.add_edge("tools", "process_todos")
-        builder.add_edge("process_todos", "agent")
-
-        # 普通边: 上下文检查 → todo 上下文检测 → todo 完成防护 → 结束
-        builder.add_edge("check_context", "todo_check")
-
-        # todo_check 后检查是否有提醒注入:
-        #   - 如果注入了提醒 → 回到 agent 让 LLM 看到提醒
-        #   - 没有 → 继续 todo_guard
-        def route_after_todo_check(state: AgentState):
-            messages = state.get("messages", [])
-            if messages and isinstance(messages[-1], HumanMessage):
-                name = getattr(messages[-1], "name", None)
-                if name == "todo_reminder":
-                    return "agent"
-            return "todo_guard"
-
-        builder.add_conditional_edges("todo_check", route_after_todo_check)
-
-        # todo_guard 后检查是否有完成提醒注入:
-        #   - 如果注入了提醒 → 回到 agent 继续工作
-        #   - 没有 → 正常结束 (返回 END 常量)
-        def route_after_todo_guard(state: AgentState):
-            messages = state.get("messages", [])
-            if messages and isinstance(messages[-1], HumanMessage):
-                name = getattr(messages[-1], "name", None)
-                if name == "todo_completion_reminder":
-                    return "agent"
-            return END
-
-        builder.add_conditional_edges("todo_guard", route_after_todo_guard)
-
-        # --- 编译 ---
-        # checkpointer 让图在执行后自动保存状态。
-        # thread_id 是隔离的 key —— 不同的对话用不同的 thread_id。
-        return builder.compile(checkpointer=self.checkpointer)
-
-    # ------------------------------------------------------------------
-    # LangGraph 核心概念 #2: stream()
-    # ------------------------------------------------------------------
-    # graph.stream() 返回一个迭代器，每完成一个"步骤"就产出事件。
-    # stream_mode=["messages"] 返回 (message_chunk, metadata)，其中:
-    #   - message_chunk: AIMessageChunk (文本或 tool_call 片段)
-    #   - metadata:      包含 langgraph_node 标识来源节点
-    #
-    # LangGraph 的 stream_mode 选项:
-    #   "values"   — 每个 super-step 后完整的 State 快照
-    #   "messages" — 每个 LLM token 产出 (流式打字机效果)
-    #   "updates"  — 每个节点产出的 State 更新 (不包含原始输入)
-    #   "custom"   — 通过 StreamWriter 发送的自定义事件
+        self.graph = create_agent(
+            model=self.model,
+            tools=self.tools,
+            system_prompt=system_prompt,
+            middleware=mw_list,
+            checkpointer=self.checkpointer,
+        )
 
     def stream(self, user_input: str, thread_id: str = "default", debug: bool = False):
-        """
-        流式执行 agent。
-
-        产出元组: (message_chunk, metadata)
-        调用方通过 metadata["langgraph_node"] 来区分别是 LLM token 还是工具结果。
-        """
         config = {"configurable": {"thread_id": thread_id}}
-
-        # LangGraph 核心概念 #3: 对话延续
-        # -----------------------------------------------------------------
-        # 通过 thread_id 和 checkpointer，LangGraph 自动管理对话历史。
-        # 第一次调用: state 为空，我们注入 SystemMessage
-        # 后续调用: state 已包含之前的消息，只需追加新的 HumanMessage
         try:
             state_snapshot = self.graph.get_state(config)
             has_history = state_snapshot and state_snapshot.values
@@ -340,54 +180,24 @@ class LangGraphAgent:
             has_history = False
 
         if not has_history:
-            subagent_section = ""
-            if self.subagent_enabled:
-                subagent_section = build_subagent_section(self.subagent_limit)
-            input_messages = [
-                SystemMessage(content=build_system_prompt(
-                    self.skills_section, subagent_section, build_todo_section(),
-                )),
-                HumanMessage(content=user_input),
-            ]
+            input_messages = [HumanMessage(content=user_input)]
         else:
             input_messages = [HumanMessage(content=user_input)]
 
-        # 为当前线程创建沙箱，注入 workspace_dir 和 skills_dir
-        from mini_agent.sandbox import Sandbox
-        sandbox = Sandbox(thread_id=thread_id, skills_dir=self.skills_dir)
-        graph_input = {
-            "messages": input_messages,
-            "workspace_dir": str(sandbox.workspace),
-            "skills_dir": str(sandbox.skills_dir) if sandbox.skills_dir else "",
-        }
-
-        # 流式执行
-        # stream_mode=["messages"] 产出 LLM token 流和工具结果。
-        # LangGraph 1.x 格式 (subgraphs=False):
-        #   ("messages", (AIMessageChunk, metadata_dict))
-        #     ↑ channel名   ↑ 实际数据
         for event in self.graph.stream(
-            graph_input,
+            {"messages": input_messages},
             config=config,
             stream_mode=["messages"],
             subgraphs=False,
         ):
             if debug:
                 print(f"\n[DEBUG event: len={len(event)}, types={tuple(type(e).__name__ for e in event)}]")
-
-            # 解包: ("messages", (msg_chunk, metadata))
-            channel_name = event[0]
             msg_chunk = event[1][0] if isinstance(event[1], tuple) else event[1]
             metadata = event[1][1] if isinstance(event[1], tuple) else {}
-
-            # 从 msg_chunk 提取可显示文本
-            # 注意: DeepSeek thinking 模型把文本放在 additional_kwargs["reasoning_content"]
             token_text = _extract_display_text(msg_chunk)
-
             yield token_text, msg_chunk, metadata
 
     def invoke(self, user_input: str, thread_id: str = "default") -> list[BaseMessage]:
-        """非流式执行，返回最终的消息列表(用于内部调用)。"""
         config = {"configurable": {"thread_id": thread_id}}
         try:
             state_snapshot = self.graph.get_state(config)
@@ -396,39 +206,19 @@ class LangGraphAgent:
             has_history = False
 
         if not has_history:
-            subagent_section = ""
-            if self.subagent_enabled:
-                subagent_section = build_subagent_section(self.subagent_limit)
-            input_messages = [
-                SystemMessage(content=build_system_prompt(
-                    self.skills_section, subagent_section, build_todo_section(),
-                )),
-                HumanMessage(content=user_input),
-            ]
+            input_messages = [HumanMessage(content=user_input)]
         else:
             input_messages = [HumanMessage(content=user_input)]
 
-        # 注入 workspace_dir 和 skills_dir
-        from mini_agent.sandbox import Sandbox
-        sandbox = Sandbox(thread_id=thread_id, skills_dir=self.skills_dir)
-        result = self.graph.invoke(
-            {"messages": input_messages, "workspace_dir": str(sandbox.workspace),
-             "skills_dir": str(sandbox.skills_dir) if sandbox.skills_dir else ""},
-            config=config,
-        )
+        result = self.graph.invoke({"messages": input_messages}, config=config)
         return result["messages"]
 
     def reset(self, thread_id: str = "default") -> None:
-        """重置对话: 用新的 thread_id 就相当于新对话。"""
-        # MemorySaver 没有直接删除某个 thread 的 API，
-        # 最简单的方式是切换 thread_id。调用方可以用 UUID 生成新的。
         pass
 
     def get_state(self, thread_id: str = "default") -> Any | None:
-        """获取当前对话状态（用于调试）。"""
         config = {"configurable": {"thread_id": thread_id}}
         try:
-            state = self.graph.get_state(config)
-            return state
+            return self.graph.get_state(config)
         except Exception:
             return None
