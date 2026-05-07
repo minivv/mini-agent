@@ -31,8 +31,8 @@ def print_banner() -> None:
     """Phase 2 欢迎信息。"""
     print()
     print("╔══════════════════════════════════════════╗")
-    print("║        Mini Agent - Phase 2              ║")
-    print("║     LangGraph ReAct Agent + Tool Call    ║")
+    print("║       Mini Agent - Phase 2-mw             ║")
+    print("║   create_agent + Middleware 模式          ║")
     print("╠══════════════════════════════════════════╣")
     print("║  命令:                                   ║")
     print("║    /reset   — 新的对话 (新 thread_id)    ║")
@@ -138,7 +138,7 @@ def main() -> None:
                 node = metadata.get("langgraph_node", "")
 
                 # --- LLM 产出的 chunk ---
-                if node == "agent":
+                if node == "model":  # create_agent 的节点名是 "model"
                     # 逐 token 打字机效果
                     if token_text and isinstance(token_text, str):
                         print(token_text, end="", flush=True)
